@@ -5,14 +5,16 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"ljr-rpc/codec"
+	"ljr-rpc/service"
 )
 
 const MagicNumber = 0x3bef5c
@@ -34,7 +36,9 @@ var DefautlOption = &Option{
 }
 
 // 服务器
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 // 构造函数
 func NewServer() *Server {
@@ -71,6 +75,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Println("ljr rpc server options error: ", err)
 		return
 	}
+
 	if opt.MagicNumber != MagicNumber {
 		log.Printf("ljr rpc server recv invalid magic number %x", opt.MagicNumber)
 		return
@@ -121,9 +126,11 @@ func (server *Server) serveCodec(cc codec.Codec) {
 
 // 请求体
 type request struct {
-	h      *codec.Header
-	argv   reflect.Value
-	replyv reflect.Value
+	h      *codec.Header       // 头部
+	argv   reflect.Value       // 参数
+	replyv reflect.Value       // 响应
+	mtype  *service.MethodType // 方法类型
+	svc    *service.Service    // 服务
 }
 
 // 读取头部 request.header
@@ -149,13 +156,36 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 
 	req := &request{h: h}
 
-	// 默认参数为 string
-	req.argv = reflect.New(reflect.TypeOf(""))
+	// 查询服务
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+
+	// 创建参数 1 参数 2 的实例
+	req.argv = req.mtype.NewArgv()
+	req.replyv = req.mtype.NewReplyv()
+
+	// 确保参数 1 为指针
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		// 转为指针
+		argvi = req.argv.Addr().Interface()
+	}
 
 	// 读取请求体 request.body
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("ljr rpc server read argv error: ", err)
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("ljr rpc server read body error: ", err)
+		return req, err
 	}
+
+	// 默认参数为 string
+	// req.argv = reflect.New(reflect.TypeOf(""))
+
+	// 读取请求体 request.body
+	// if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	// 	log.Println("ljr rpc server read argv error: ", err)
+	// }
 
 	return req, nil
 }
@@ -175,7 +205,48 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("ljr rpc response: %d", req.h.Seq))
+	// log.Println(req.h, req.argv.Elem())
+	// req.replyv = reflect.ValueOf(fmt.Sprintf("ljr rpc response: %d", req.h.Seq))
+
+	err := req.svc.Call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
+
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+}
+
+// 注册服务
+func (server *Server) Register(rcvr interface{}) error {
+	s := service.NewService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+		return errors.New("ljr rpc service already defined: " + s.Name)
+	}
+	return nil
+}
+
+// 查询服务
+func (server *Server) findService(serviceMethod string) (svc *service.Service, mtype *service.MethodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("ljr rpc server service/method request ill-fomed: " + serviceMethod)
+		return
+	}
+
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("ljr rpc server can not find service: " + serviceName)
+		return
+	}
+
+	svc = svci.(*service.Service)
+	mtype = svc.Method[methodName]
+	if mtype == nil {
+		err = errors.New("ljr rpc server can not find method: " + methodName)
+	}
+
+	return
 }
